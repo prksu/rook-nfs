@@ -3,6 +3,7 @@ module github.com/prksu/rook-nfs
 go 1.13
 
 require (
+	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
 	github.com/operator-framework/operator-sdk v0.17.0
 	github.com/rook/rook v1.3.3
 	github.com/spf13/pflag v1.0.5
@@ -10,6 +11,7 @@ require (
 	k8s.io/apimachinery v0.17.4
 	k8s.io/client-go v12.0.0+incompatible
 	sigs.k8s.io/controller-runtime v0.5.2
+	sigs.k8s.io/sig-storage-lib-external-provisioner v4.1.0+incompatible
 )
 
 replace (
