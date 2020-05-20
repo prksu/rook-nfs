@@ -1,7 +1,0 @@
-apiVersion: nfs.rook.io/v1alpha1
-kind: NFSServer
-metadata:
-  name: example-nfsserver
-spec:
-  # Add fields here
-  size: 3
