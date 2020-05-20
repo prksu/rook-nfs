@@ -3,6 +3,7 @@ package nfsserver
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/coreos/pkg/capnslog"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -74,6 +76,10 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
+	if err := c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, owner); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -120,6 +126,10 @@ func (r *ReconcileNFSServer) Reconcile(request reconcile.Request) (reconcile.Res
 	}
 
 	if err := r.createOrUpdateStatefulSet(ctx, instance); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := r.createOrUpdateProvisioner(ctx, instance); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -209,10 +219,113 @@ func (r *ReconcileNFSServer) createOrUpdateStatefulSet(ctx context.Context, cr *
 	return err
 }
 
+func (r *ReconcileNFSServer) createOrUpdateProvisioner(ctx context.Context, cr *nfsv1alpha1.NFSServer) error {
+	serversvc := &corev1.Service{}
+	if err := r.client.Get(context.Background(), types.NamespacedName{Namespace: cr.Namespace, Name: cr.Name}, serversvc); err != nil {
+		return err
+	}
+
+	provisionerdep := newDeploymentForProvisioner(cr)
+	_, err := controllerutil.CreateOrUpdate(ctx, r.client, provisionerdep, func() error {
+
+		if provisionerdep.ObjectMeta.CreationTimestamp.IsZero() {
+			provisionerdep.Spec.Selector = &metav1.LabelSelector{
+				MatchLabels: newLabels(cr),
+			}
+		}
+
+		if err := controllerutil.SetControllerReference(cr, provisionerdep, r.scheme); err != nil {
+			return err
+		}
+
+		var volumes []v1.Volume
+		var volumeMounts []v1.VolumeMount
+		for _, export := range cr.Spec.Exports {
+			shareName := export.Name
+			claimName := export.PersistentVolumeClaim.ClaimName
+			volumes = append(volumes, v1.Volume{
+				Name: shareName,
+				VolumeSource: v1.VolumeSource{
+					NFS: &v1.NFSVolumeSource{
+						Server: serversvc.Spec.ClusterIP,
+						Path:   "/" + claimName,
+					},
+				},
+			})
+
+			volumeMounts = append(volumeMounts, v1.VolumeMount{
+				Name:      shareName,
+				MountPath: filepath.Join("/persistentvolumes", claimName),
+			})
+		}
+
+		provisionerdep.Spec.Template.Spec.Containers[0].VolumeMounts = volumeMounts
+		provisionerdep.Spec.Template.Spec.Volumes = volumes
+
+		return nil
+	})
+
+	return err
+}
+
 func newLabels(cr *nfsv1alpha1.NFSServer) map[string]string {
 	return map[string]string{
 		k8sutil.AppAttr: cr.Name,
 	}
+}
+
+func newDeploymentForProvisioner(cr *nfsv1alpha1.NFSServer) *appsv1.Deployment {
+	name := cr.Name + "-provisioner"
+	provisionerName := "nfs.rook.io/" + name
+	replicas := int32(1)
+	defaultTerminationGracePeriodSeconds := int64(30)
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cr.Namespace,
+			Labels:    newLabels(cr),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: newLabels(cr),
+				},
+				Spec: v1.PodSpec{
+					ServiceAccountName: "rook-nfs-provisioner",
+					Containers: []corev1.Container{
+						{
+							Name:                     "rook-nfs-provisioner",
+							Image:                    "docker.io/ahmadnurus/rook-nfs-provisioner",
+							ImagePullPolicy:          corev1.PullIfNotPresent,
+							Ports:                    []corev1.ContainerPort{},
+							TerminationMessagePath:   "/dev/termination-log",
+							TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+							Env: []corev1.EnvVar{
+								{
+									Name:  "PROVISIONER_NAME",
+									Value: provisionerName,
+								},
+							},
+						},
+					},
+					RestartPolicy:                 corev1.RestartPolicyAlways,
+					TerminationGracePeriodSeconds: &defaultTerminationGracePeriodSeconds,
+					DNSPolicy:                     corev1.DNSClusterFirst,
+					SecurityContext:               &corev1.PodSecurityContext{},
+					SchedulerName:                 corev1.DefaultSchedulerName,
+				},
+			},
+		},
+	}
+}
+
+func newVolumeMountForProvisioner(cr *nfsv1alpha1.NFSServer) []v1.VolumeMount {
+	var volumeMounts []v1.VolumeMount
+	volumeMounts = append(volumeMounts, v1.VolumeMount{
+		Name: "nfs-root",
+	})
+	return volumeMounts
 }
 
 func newConfigMapForCR(cr *nfsv1alpha1.NFSServer) *v1.ConfigMap {
